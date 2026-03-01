@@ -26,14 +26,11 @@ Decision-Making-under-Uncertainty/
 │   ├── SystemCharacteristics.py                 # System parameters 
 │   ├── PlotsRestaurant.py                       # Visualization 
 │   ├── Data_JSON/
-│   │   └── FixedData.json                       # Fixed system data 
-│   data visualization
-data loading
+│   │   └── FixedData.json                       # Fixed system data (data visualization)
 │   ├── OccupancyRoom1.csv                       # Room 1 occupancy data
 │   ├── OccupancyRoom2.csv                       # Room 2 occupancy data
 │   ├── PriceData.csv                            # Electricity price
 │   └── __pycache__/                             # Python cache files
-raw data
 ```
 
 ## System Dynamics
