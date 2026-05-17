@@ -188,6 +188,13 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
                 eta[9] * m.pen2x +
                 eta[10])
 
+    # ── Big-M safety penalty: prevent T1x / T2x from dropping below 18.5°C ──
+    m.saf_pen1 = pyo.Var(domain=pyo.NonNegativeReals)
+    m.saf_pen2 = pyo.Var(domain=pyo.NonNegativeReals)
+    m.c_saf1   = pyo.Constraint(expr=m.saf_pen1 >= 18.5 - m.T1x)
+    m.c_saf2   = pyo.Constraint(expr=m.saf_pen2 >= 18.5 - m.T2x)
+    safety_penalty = 1_000.0 * (m.saf_pen1 + m.saf_pen2)
+
     # ── Big-M soft overrule penalties ─────────────────────────────────────────
     _penalty = []
     if c > 0 or H >= p['H_high']:
@@ -203,7 +210,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     overrule_penalty = sum(_penalty) if _penalty else 0.0
 
     m.obj = pyo.Objective(
-        expr=price*(m.p1 + m.p2 + p['P_vent']*m.v) + vfa_next + overrule_penalty,
+        expr=price*(m.p1 + m.p2 + p['P_vent']*m.v) + vfa_next + overrule_penalty + safety_penalty,
         sense=pyo.minimize)
 
     solver = pyo.SolverFactory('gurobi')
