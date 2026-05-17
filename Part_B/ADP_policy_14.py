@@ -31,19 +31,23 @@ params = {
 # phi(state) — 9 features, all O(1):
 #   [T1/30, T2/30, H/100, price/10, price_prev/10, occ1/40, occ2/30, c/2, 1]
 # ==============================================================================
-N_FEAT = 9
+N_FEAT = 11
 
 
 def _phi(state: dict) -> np.ndarray:
+    T1 = float(state['T1'])
+    T2 = float(state['T2'])
     return np.array([
-        float(state['T1'])                                 / 30.0,
-        float(state['T2'])                                 / 30.0,
+        T1                                                 / 30.0,
+        T2                                                 / 30.0,
         float(state.get('H', 0.0))                         / 100.0,
         float(state['price'])                              / 10.0,
         float(state.get('price_previous', state['price'])) / 10.0,
         float(state.get('occ1', 0.0))                      / 40.0,
         float(state.get('occ2', 0.0))                      / 30.0,
         float(state.get('c', 0))                           / 2.0,
+        max(0.0, 19.5 - T1)                                / 5.0,
+        max(0.0, 19.5 - T2)                                / 5.0,
         1.0,
     ])
 
@@ -72,7 +76,7 @@ try:
         print(f"[ADP]   t={_t}: {np.round(ETA[_t], 4)}")
 except FileNotFoundError:
     print(f"[ADP] WARNING: {_WEIGHTS_PATH} not found — using zero weights")
-    ETA = {t: [0.0] * N_FEAT for t in range(10)}
+    ETA = {t: [0.0] * N_FEAT for t in range(10)}  # N_FEAT=11
 
 # ==============================================================================
 # 4. EXPECTED NEXT-PERIOD EXOGENOUS VALUES  (K=50 Monte-Carlo mean)
@@ -161,18 +165,28 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     elif c == 1: c_next = 0.0
     else:        c_next = 1.0
 
-    # ── Linear VFA of expected next state ─────────────────────────────────────
-    # phi = [T1x/30, T2x/30, Hx/100, E[price_next]/10, price_t/10,
-    #        E[occ1_next]/40, E[occ2_next]/30, c_next/2, 1]
-    vfa_next = (eta[0]*(m.T1x          / 30.0) +
-                eta[1]*(m.T2x          / 30.0) +
-                eta[2]*(m.Hx           / 100.0) +
-                eta[3]*(exp_price_next / 10.0) +
-                eta[4]*(price          / 10.0) +
-                eta[5]*(exp_occ1       / 40.0) +
-                eta[6]*(exp_occ2       / 30.0) +
-                eta[7]*(c_next         / 2.0) +
-                eta[8])
+    # ── LP linearisation of pen features for next state ───────────────────────
+    # pen_rx = max(0, 19.5 - T_rx) / 5.  With eta[8]/eta[9] > 0, minimisation
+    # drives pen_rx to its lower bound = max(0, (19.5-T_rx)/5).
+    m.pen1x   = pyo.Var(bounds=(0, 5.0))
+    m.pen2x   = pyo.Var(bounds=(0, 5.0))
+    m.c_pen1x = pyo.Constraint(expr=m.pen1x >= (19.5 - m.T1x) / 5.0)
+    m.c_pen2x = pyo.Constraint(expr=m.pen2x >= (19.5 - m.T2x) / 5.0)
+
+    # ── Linear VFA of expected next state (11 features) ───────────────────────
+    # phi = [T1x/30, T2x/30, Hx/100, E[price]/10, price_t/10,
+    #        E[occ1]/40, E[occ2]/30, c_next/2, pen1x, pen2x, 1]
+    vfa_next = (eta[0] *(m.T1x         / 30.0) +
+                eta[1] *(m.T2x         / 30.0) +
+                eta[2] *(m.Hx          / 100.0) +
+                eta[3] *(exp_price_next / 10.0) +
+                eta[4] *(price          / 10.0) +
+                eta[5] *(exp_occ1       / 40.0) +
+                eta[6] *(exp_occ2       / 30.0) +
+                eta[7] *(c_next         / 2.0) +
+                eta[8] * m.pen1x +
+                eta[9] * m.pen2x +
+                eta[10])
 
     # ── Big-M soft overrule penalties ─────────────────────────────────────────
     _penalty = []
