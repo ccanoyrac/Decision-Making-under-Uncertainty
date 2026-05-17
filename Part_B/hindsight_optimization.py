@@ -123,7 +123,7 @@ def _solve_day(prices, occ1s, occ2s, T_outs=_P['T_out'],
     # Overrule state of the system BEFORE step 0 (determined by initial state)
     y_hi1_0 = 1 if float(T1_init) > p['T_high'] else 0
     y_hi2_0 = 1 if float(T2_init) > p['T_high'] else 0
-    h_ov_0  = 1 if float(H_init)  > p['H_high'] else 0
+    # h_ov_0 no longer needed: z_hum[0] handles the t=0 humidity overrule automatically
 
     M = pyo.ConcreteModel()
 
@@ -153,7 +153,7 @@ def _solve_day(prices, occ1s, occ2s, T_outs=_P['T_out'],
     # z_ahiR[t] = 1: T_Rx[t] > T_high (triggers pR[t+1] = 0)
     M.z_ahi1 = pyo.Var(T, domain=pyo.Binary)
     M.z_ahi2 = pyo.Var(T, domain=pyo.Binary)
-    # z_hum[t] = 1: Hx[t] > H_high    (triggers v[t+1] = 1)
+    # z_hum[t] = 1: Hx[t] > H_high    (triggers v[t] = 1, same step — matches environment)
     M.z_hum  = pyo.Var(T, domain=pyo.Binary)
 
     M.cons = pyo.ConstraintList()
@@ -198,11 +198,13 @@ def _solve_day(prices, occ1s, occ2s, T_outs=_P['T_out'],
             M.cons.add(M.p1[t] <= p['P_max'] * (1 - M.z_ahi1[t-1]))
             M.cons.add(M.p2[t] <= p['P_max'] * (1 - M.z_ahi2[t-1]))
 
-        # ── (3) Humidity overrule: previous H > H_high → v = 1 ─────────
-        if t == 0:
-            if h_ov_0: M.cons.add(M.v[0] == 1)
-        else:
-            M.cons.add(M.v[t] >= M.z_hum[t-1])
+        # ── (3) Humidity overrule: current H >= H_high → v = 1 (same step) ──
+        # Matches Task6_Environment: "if H >= H_high: v = 1" at the current step t.
+        # z_hum[t] is defined below in the Big-M block; Pyomo adds constraints
+        # symbolically so ordering within the loop body does not matter.
+        # At t=0: Hx[0]=H_init is pinned, so z_hum[0]=1 automatically when H_init>H_high,
+        # replacing the former h_ov_0 special case.
+        M.cons.add(M.v[t] >= M.z_hum[t])
 
         # ── Dynamics (using previous timestep actions per assignment Eq. 2-3) ──
         if t != 0:

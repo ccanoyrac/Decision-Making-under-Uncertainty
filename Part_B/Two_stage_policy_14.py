@@ -356,11 +356,22 @@ def select_action(state: dict) -> dict:
     BRANCHES = 10
     N_INIT   = 10000
 
+    p = _P
+
+    # At the last time step there is no future to plan for — skip the MILP
+    # and fall back directly to the reactive dummy action.
+    if int(state.get('current_time', 0)) >= 9:
+        return {
+            'HeatPowerRoom1': p['P_max'] if state.get('y_low_1') else 0.0,
+            'HeatPowerRoom2': p['P_max'] if state.get('y_low_2') else 0.0,
+            'VentilationON' : 1 if (int(state.get('c', 0)) > 0
+                                    or float(state.get('H', 0)) >= p['H_high']) else 0,
+        }
+
     try:
         nodes = _build_tree(state, HORIZON, BRANCHES, N_INIT)
         return _solve_sp(state, nodes)
     except Exception:
-        p = _P
         return {
             'HeatPowerRoom1': p['P_max'] if state.get('y_low_1') else 0.0,
             'HeatPowerRoom2': p['P_max'] if state.get('y_low_2') else 0.0,
