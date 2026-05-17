@@ -64,8 +64,18 @@ try:
     with open(_WEIGHTS_PATH) as _f:
         _w = json.load(_f)
     ETA = {int(t): _w['eta'][t] for t in _w['eta']}
+    _bad = [t for t, v in ETA.items() if not np.all(np.isfinite(v))]
+    if _bad:
+        raise ValueError(f"NaN/Inf in weights at t={_bad}")
+    print(f"[ADP] Loaded weights OK — {len(ETA)} timesteps")
+    for _t in sorted(ETA)[:3]:
+        print(f"[ADP]   t={_t}: {np.round(ETA[_t], 4)}")
 except FileNotFoundError:
-    # Fallback: reasonable order-of-magnitude values on scaled features
+    print(f"[ADP] WARNING: {_WEIGHTS_PATH} not found — using fallback weights")
+    _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
+    ETA = {t: _fallback for t in range(10)}
+except ValueError as _e:
+    print(f"[ADP] WARNING: {_e} — using fallback weights")
     _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
     ETA = {t: _fallback for t in range(10)}
 
@@ -127,8 +137,8 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     m.T1x  = pyo.Var(m.K_set)
     m.T2x  = pyo.Var(m.K_set)
     m.Hx   = pyo.Var(m.K_set)
-    m.pen1 = pyo.Var(m.K_set, bounds=(0, 20.0))
-    m.pen2 = pyo.Var(m.K_set, bounds=(0, 20.0))
+    m.pen1 = pyo.Var(m.K_set, domain=pyo.NonNegativeReals)  # unbounded: extreme scenarios never infeasible
+    m.pen2 = pyo.Var(m.K_set, domain=pyo.NonNegativeReals)
 
     # ── Per-scenario dynamics ─────────────────────────────────────────────────
     def _dT1(m, k):
@@ -162,21 +172,21 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     m.pen1_c = pyo.Constraint(m.K_set, rule=_pen1_c)
     m.pen2_c = pyo.Constraint(m.K_set, rule=_pen2_c)
 
-    # ── Hard overrule constraints (state flags fully observed online) ─────────
-    if c > 0:
-        m.vc = pyo.Constraint(expr=m.v == 1)
-    if H >= p['H_high']:
-        m.hc = pyo.Constraint(expr=m.v == 1)
+    # ── Big-M soft overrule penalties (same pattern as notebook; always feasible) ──
+    _penalty = []
+    if c > 0 or H >= p['H_high']:
+        _penalty.append(1_000 * (1 - m.v))
     if state.get('y_low_1'):
-        m.h1l = pyo.Constraint(expr=m.p1 == P_max)
+        _penalty.append(1_000 * (P_max - m.p1))
     if state.get('y_low_2'):
-        m.h2l = pyo.Constraint(expr=m.p2 == P_max)
+        _penalty.append(1_000 * (P_max - m.p2))
     if state.get('y_high_1'):
-        m.h1h = pyo.Constraint(expr=m.p1 == 0.0)
+        _penalty.append(1_000 * m.p1)
     if state.get('y_high_2'):
-        m.h2h = pyo.Constraint(expr=m.p2 == 0.0)
+        _penalty.append(1_000 * m.p2)
+    overrule_penalty = sum(_penalty) if _penalty else 0.0
 
-    # c_next: c=0 → 2v | c=1,v=1 → 0 | c=2,v=1 → 1
+    # c_next: c=0 → 2v | c=1 → 0 (v irrelevant) | c=2 → 1 (Big-M drives v=1)
     if   c == 0: c_next = 2.0 * m.v
     elif c == 1: c_next = 0.0
     else:        c_next = 1.0
@@ -195,7 +205,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     vfa_expected = eta_k_sum / K
 
     m.obj = pyo.Objective(
-        expr=price*(m.p1 + m.p2 + p['P_vent']*m.v) + vfa_expected,
+        expr=price*(m.p1 + m.p2 + p['P_vent']*m.v) + vfa_expected + overrule_penalty,
         sense=pyo.minimize)
 
     solver = pyo.SolverFactory('gurobi')
@@ -205,6 +215,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     result = solver.solve(m)
 
     if result.solver.termination_condition != pyo.TerminationCondition.optimal:
+        print(f"SOLVER FAILED at t={t}: {result.solver.termination_condition}")
         return {'HeatPowerRoom1': 0.0, 'HeatPowerRoom2': 0.0, 'VentilationON': 0}
 
     return {
