@@ -26,10 +26,33 @@ params = {
 }
 
 # ==============================================================================
-# 2. TIME-DEPENDENT VFA WEIGHTS  (produced by ADP_policy_14.ipynb)
+# 2. SCALED BASIS FUNCTION
 #
-# ETA[t] is a 7-element list corresponding to features:
-#   [(T1-T_ok)^2, (T2-T_ok)^2, H, c, max(0,T_low-T1), max(0,T_low-T2), 1]
+# Scaling constants (5, 100, 2, 4) must match the notebook (cell-03 / cell-06).
+# ==============================================================================
+def _phi(state: dict) -> np.ndarray:
+    """Scaled 7-feature basis function — all features ≈ O(1)."""
+    T1 = float(state['T1'])
+    T2 = float(state['T2'])
+    H  = float(state.get('H', 0.0))
+    c  = float(state.get('c', 0))
+    T_ok  = params['T_ok']
+    T_low = params['T_low']
+    return np.array([
+        ((T1 - T_ok) / 5.0)**2,
+        ((T2 - T_ok) / 5.0)**2,
+        H / 100.0,
+        c / 2.0,
+        max(0.0, T_low - T1) / 4.0,
+        max(0.0, T_low - T2) / 4.0,
+        1.0,
+    ])
+
+
+# ==============================================================================
+# 3. TIME-DEPENDENT VFA WEIGHTS  (produced by ADP_policy_14.ipynb)
+#
+# ETA[t] is a 7-element list corresponding to the scaled features in _phi().
 # ==============================================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _WEIGHTS_PATH = os.path.join(_HERE, 'output', 'adp_weights.json')
@@ -39,12 +62,12 @@ try:
         _w = json.load(_f)
     ETA = {int(t): _w['eta'][t] for t in _w['eta']}
 except FileNotFoundError:
-    # Fallback weights (kept for safety before first notebook run)
-    _fallback = [2.2667, 2.2761, 5.1160, 0.0270, 0.0368, 0.0, 0.0]
+    # Fallback weights — reasonable order-of-magnitude values on scaled features
+    _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
     ETA = {t: _fallback for t in range(10)}
 
 # ==============================================================================
-# 3. SCENARIO GENERATION PARAMETERS
+# 4. SCENARIO GENERATION PARAMETERS
 # ==============================================================================
 K = 5                          # number of next-period scenarios
 _OCC1_LO, _OCC1_HI = 25, 35   # occupancy range room 1 (persons)
@@ -63,21 +86,17 @@ def _sample_scenarios():
 
 
 # ==============================================================================
-# 4. ONLINE K-SCENARIO ADP OPTIMIZER
+# 5. ONLINE K-SCENARIO ADP OPTIMIZER
 # ==============================================================================
 def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     """
     Solve the here-and-now MIQP with K-scenario expectation:
 
         min_{p1,p2,v}  price*(p1 + p2 + P_vent*v)
-                       + (1/K) * sum_{k=1}^K [ eta_{t+1}^T * phi(x_{k,t+1}(p1,p2,v)) ]
+                       + (1/K) * sum_{k=1}^K [ eta_{t+1}^T * phi_scaled(x_{k,t+1}) ]
 
-    For each scenario k a different occupancy sample (occ1_k, occ2_k) is drawn
-    from the next-period distribution, giving K different post-decision states
-    x_{k,t+1}.  The decision variables (p1, p2, v) are shared across scenarios.
-
-    phi(x_next) = [(T1x-T_ok)^2, (T2x-T_ok)^2, Hx, c_next, pen1, pen2, 1]
-    expressed as Pyomo expressions via the post-decision dynamics.
+    Scaling inside the VFA (factors 5, 100, 2, 4) matches _phi() and the
+    notebook's phi() / solve_1step().
     """
     p     = params
     P_max = p['P_max']
@@ -159,14 +178,14 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     elif c == 1: c_next = 0.0
     else:        c_next = 1.0
 
-    # ── K-scenario VFA: average eta^T * phi(x_{k,t+1}) over all scenarios ────
+    # ── K-scenario VFA with scaled features ──────────────────────────────────
     eta_k_sum = sum(
-        eta[0]*(m.T1x[k] - T_ok)**2 +
-        eta[1]*(m.T2x[k] - T_ok)**2 +
-        eta[2]*m.Hx[k] +
-        eta[3]*c_next +
-        eta[4]*m.pen1[k] +
-        eta[5]*m.pen2[k] +
+        eta[0]*((m.T1x[k] - T_ok) / 5.0)**2 +
+        eta[1]*((m.T2x[k] - T_ok) / 5.0)**2 +
+        eta[2]*(m.Hx[k] / 100.0) +
+        eta[3]*(c_next / 2.0) +
+        eta[4]*(m.pen1[k] / 4.0) +
+        eta[5]*(m.pen2[k] / 4.0) +
         eta[6]
         for k in range(K)
     )
@@ -178,7 +197,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
 
     solver = pyo.SolverFactory('gurobi')
     solver.options['OutputFlag'] = 0
-    solver.options['NonConvex']  = 2   # required for quadratic VFA terms
+    solver.options['NonConvex']  = 2
 
     result = solver.solve(m)
 
@@ -193,9 +212,22 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
 
 
 # ==============================================================================
-# 5. POLICY ENTRY POINT  (called by Task6_Environment.run_policy)
+# 6. POLICY ENTRY POINT  (called by Task6_Environment.run_policy)
 # ==============================================================================
 def select_action(state: dict) -> dict:
     t   = int(state.get('current_time', 0))
     eta = ETA.get(t, ETA[max(ETA.keys())])
-    return solve_adp_step(state, eta, params)
+    decisions = solve_adp_step(state, eta, params)
+
+    # ── Diagnostics: compare immediate cost vs VFA contribution ──────────────
+    p1    = decisions['HeatPowerRoom1']
+    p2    = decisions['HeatPowerRoom2']
+    v     = decisions['VentilationON']
+    price = float(state['price'])
+    imm   = price * (p1 + p2 + params['P_vent'] * v)
+    vfa   = float(np.dot(eta, _phi(state)))
+    print(f"  t={t} | p1={p1:.2f} p2={p2:.2f} v={v}"
+          f" | imm={imm:.3f} vfa_curr={vfa:.2f} | price={price:.2f}"
+          f" | T1={state['T1']:.1f} T2={state['T2']:.1f}")
+
+    return decisions
