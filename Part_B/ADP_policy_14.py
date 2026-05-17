@@ -64,18 +64,20 @@ try:
     with open(_WEIGHTS_PATH) as _f:
         _w = json.load(_f)
     ETA = {int(t): _w['eta'][t] for t in _w['eta']}
-    _bad = [t for t, v in ETA.items() if not np.all(np.isfinite(v))]
-    if _bad:
-        raise ValueError(f"NaN/Inf in weights at t={_bad}")
+    # Sanitize in-place: replace any NaN/Inf with 0.0 so Pyomo never sees bad floats
+    _n_fixed = 0
+    for _t, _v in ETA.items():
+        for _i, _val in enumerate(_v):
+            if not np.isfinite(_val):
+                _v[_i] = 0.0
+                _n_fixed += 1
+    if _n_fixed:
+        print(f"[ADP] WARNING: Replaced {_n_fixed} NaN/Inf weight values with 0.0")
     print(f"[ADP] Loaded weights OK — {len(ETA)} timesteps")
     for _t in sorted(ETA)[:3]:
         print(f"[ADP]   t={_t}: {np.round(ETA[_t], 4)}")
 except FileNotFoundError:
     print(f"[ADP] WARNING: {_WEIGHTS_PATH} not found — using fallback weights")
-    _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
-    ETA = {t: _fallback for t in range(10)}
-except ValueError as _e:
-    print(f"[ADP] WARNING: {_e} — using fallback weights")
     _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
     ETA = {t: _fallback for t in range(10)}
 
