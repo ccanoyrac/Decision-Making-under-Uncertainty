@@ -26,33 +26,36 @@ params = {
 }
 
 # ==============================================================================
-# 2. SCALED BASIS FUNCTION
+# 2. SCALED BASIS FUNCTION  (must match notebook cell-03 and cell-06)
 #
-# Scaling constants (5, 100, 2, 4) must match the notebook (cell-03 / cell-06).
+# ETA[t] is a 7-element list for features:
+#   [((T1-T_ok)/5)^2,  ((T2-T_ok)/5)^2,  H/100,  c/2,
+#    max(0,T_warn-T1)/5,  max(0,T_warn-T2)/5,  1]
+# where T_warn = T_low + 1.0 = 19°C.
 # ==============================================================================
+_T_WARN = _raw['temp_min_comfort_threshold'] + 1.0   # 19°C early-warning threshold
+
+
 def _phi(state: dict) -> np.ndarray:
     """Scaled 7-feature basis function — all features ≈ O(1)."""
     T1 = float(state['T1'])
     T2 = float(state['T2'])
     H  = float(state.get('H', 0.0))
     c  = float(state.get('c', 0))
-    T_ok  = params['T_ok']
-    T_low = params['T_low']
+    T_ok = params['T_ok']
     return np.array([
         ((T1 - T_ok) / 5.0)**2,
         ((T2 - T_ok) / 5.0)**2,
         H / 100.0,
         c / 2.0,
-        max(0.0, T_low - T1) / 4.0,
-        max(0.0, T_low - T2) / 4.0,
+        max(0.0, _T_WARN - T1) / 5.0,
+        max(0.0, _T_WARN - T2) / 5.0,
         1.0,
     ])
 
 
 # ==============================================================================
 # 3. TIME-DEPENDENT VFA WEIGHTS  (produced by ADP_policy_14.ipynb)
-#
-# ETA[t] is a 7-element list corresponding to the scaled features in _phi().
 # ==============================================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _WEIGHTS_PATH = os.path.join(_HERE, 'output', 'adp_weights.json')
@@ -62,19 +65,19 @@ try:
         _w = json.load(_f)
     ETA = {int(t): _w['eta'][t] for t in _w['eta']}
 except FileNotFoundError:
-    # Fallback weights — reasonable order-of-magnitude values on scaled features
+    # Fallback: reasonable order-of-magnitude values on scaled features
     _fallback = [10.0, 10.0, 5.0, 3.0, 8.0, 8.0, 0.0]
     ETA = {t: _fallback for t in range(10)}
 
 # ==============================================================================
 # 4. SCENARIO GENERATION PARAMETERS
 # ==============================================================================
-K = 5                          # number of next-period scenarios
+K = 50                         # number of next-period scenarios
 _OCC1_LO, _OCC1_HI = 25, 35   # occupancy range room 1 (persons)
 _OCC2_LO, _OCC2_HI = 15, 25   # occupancy range room 2 (persons)
 _PRICE_LO, _PRICE_HI = 2, 8   # electricity price range (euro/kWh)
 
-_rng = np.random.default_rng(seed=None)  # seeded fresh each import
+_rng = np.random.default_rng(seed=None)
 
 
 def _sample_scenarios():
@@ -93,24 +96,24 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     Solve the here-and-now MIQP with K-scenario expectation:
 
         min_{p1,p2,v}  price*(p1 + p2 + P_vent*v)
-                       + (1/K) * sum_{k=1}^K [ eta_{t+1}^T * phi_scaled(x_{k,t+1}) ]
+                       + (1/K) * sum_k [ eta^T * phi_scaled(x_{k,t+1}) ]
 
-    Scaling inside the VFA (factors 5, 100, 2, 4) matches _phi() and the
-    notebook's phi() / solve_1step().
+    pen1[k]/pen2[k] linearise max(0, T_warn - T_rx[k]) with T_warn = 19°C.
+    All /5.0 scalings match _phi() and the notebook's phi() / solve_1step().
     """
-    p     = params
-    P_max = p['P_max']
-    T_ok  = p['T_ok']
-    T_low = p['T_low']
-    t     = int(state.get('current_time', 0))
-    T_out = float(p['T_out'][min(t, 9)])
-    T1    = float(state['T1'])
-    T2    = float(state['T2'])
-    H     = float(state.get('H', 0.0))
-    c     = int(state.get('c', 0))
-    price = float(state['price'])
+    p      = params
+    P_max  = p['P_max']
+    T_ok   = p['T_ok']
+    T_warn = _T_WARN               # 19°C — must match _phi()
+    t      = int(state.get('current_time', 0))
+    T_out  = float(p['T_out'][min(t, 9)])
+    T1     = float(state['T1'])
+    T2     = float(state['T2'])
+    H      = float(state.get('H', 0.0))
+    c      = int(state.get('c', 0))
+    price  = float(state['price'])
 
-    occ1_k, occ2_k, _ = _sample_scenarios()   # K next-period occ samples
+    occ1_k, occ2_k, _ = _sample_scenarios()
 
     m = pyo.ConcreteModel()
 
@@ -127,7 +130,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     m.pen1 = pyo.Var(m.K_set, bounds=(0, 20.0))
     m.pen2 = pyo.Var(m.K_set, bounds=(0, 20.0))
 
-    # ── Per-scenario dynamics constraints ─────────────────────────────────────
+    # ── Per-scenario dynamics ─────────────────────────────────────────────────
     def _dT1(m, k):
         return m.T1x[k] == (T1 + p['zeta_exch']*(T2 - T1)
                             + p['zeta_loss']*(T_out - T1)
@@ -146,11 +149,12 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
         return m.Hx[k] == (H + p['eta_occ']*(occ1_k[k] + occ2_k[k])
                            - p['eta_vent']*m.v)
 
+    # Early-warning pen: triggers at T_warn = 19°C (1°C before hard overrule)
     def _pen1_c(m, k):
-        return m.pen1[k] >= T_low - m.T1x[k]
+        return m.pen1[k] >= T_warn - m.T1x[k]
 
     def _pen2_c(m, k):
-        return m.pen2[k] >= T_low - m.T2x[k]
+        return m.pen2[k] >= T_warn - m.T2x[k]
 
     m.dyn_T1 = pyo.Constraint(m.K_set, rule=_dT1)
     m.dyn_T2 = pyo.Constraint(m.K_set, rule=_dT2)
@@ -158,7 +162,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     m.pen1_c = pyo.Constraint(m.K_set, rule=_pen1_c)
     m.pen2_c = pyo.Constraint(m.K_set, rule=_pen2_c)
 
-    # ── Overrule constraints (hard — state flags are fully observed online) ───
+    # ── Hard overrule constraints (state flags fully observed online) ─────────
     if c > 0:
         m.vc = pyo.Constraint(expr=m.v == 1)
     if H >= p['H_high']:
@@ -172,8 +176,7 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     if state.get('y_high_2'):
         m.h2h = pyo.Constraint(expr=m.p2 == 0.0)
 
-    # c_next is linear in v given current c
-    # c=0 → 2v  |  c=1, v forced=1 → 0  |  c=2, v forced=1 → 1
+    # c_next: c=0 → 2v | c=1,v=1 → 0 | c=2,v=1 → 1
     if   c == 0: c_next = 2.0 * m.v
     elif c == 1: c_next = 0.0
     else:        c_next = 1.0
@@ -184,8 +187,8 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
         eta[1]*((m.T2x[k] - T_ok) / 5.0)**2 +
         eta[2]*(m.Hx[k] / 100.0) +
         eta[3]*(c_next / 2.0) +
-        eta[4]*(m.pen1[k] / 4.0) +
-        eta[5]*(m.pen2[k] / 4.0) +
+        eta[4]*(m.pen1[k] / 5.0) +
+        eta[5]*(m.pen2[k] / 5.0) +
         eta[6]
         for k in range(K)
     )
@@ -219,7 +222,7 @@ def select_action(state: dict) -> dict:
     eta = ETA.get(t, ETA[max(ETA.keys())])
     decisions = solve_adp_step(state, eta, params)
 
-    # ── Diagnostics: compare immediate cost vs VFA contribution ──────────────
+    # ── Diagnostics: immediate cost vs VFA at current state ──────────────────
     p1    = decisions['HeatPowerRoom1']
     p2    = decisions['HeatPowerRoom2']
     v     = decisions['VentilationON']
