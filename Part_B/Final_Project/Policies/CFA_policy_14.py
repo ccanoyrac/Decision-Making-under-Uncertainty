@@ -20,7 +20,7 @@ VFA features (same normalisation as Hybrid_policy.py):
     H_feat         = (H_next  - 40) / 40
     c_feat         ≈ v * (2/3)                  [linear approx, keeps MILP linear]
     price_prev_feat = price_t / 10              [current price becomes prev next step]
-    E[price_next, occ1_next, occ2_next]         [MC constant from CSV draws]
+    E[price_next, occ1_next, occ2_next]         [MC draws from stochastic process models]
 
 Public interface:
     select_action(state) -> {'HeatPowerRoom1', 'HeatPowerRoom2', 'VentilationON'}
@@ -29,9 +29,10 @@ Public interface:
 import os
 import json
 import numpy as np
-import pandas as pd
 import pyomo.environ as pyo
 from  Data.v2_SystemCharacteristics import get_fixed_data
+from  Data.PriceProcessRestaurant    import price_model
+from  Data.OccupancyProcessRestaurant import next_occupancy_levels
 
 # ── System parameters ─────────────────────────────────────────────────────────
 _SYS = get_fixed_data()
@@ -62,30 +63,18 @@ try:
 except FileNotFoundError:
     _VFA = {}
 
-# ── CSV scenario data ─────────────────────────────────────────────────────────
-_price_df   = pd.read_csv(os.path.join(_dir, 'Data/v2_PriceData.csv'),   header=0)
-_occ1_df    = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom1.csv'), header=0)
-_occ2_df    = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom2.csv'), header=0)
-
-_PRICES_ARR = _price_df[[str(i) for i in range(1, 11)]].values
-_OCC1_ARR   = _occ1_df[[str(i)  for i in range(10)]].values
-_OCC2_ARR   = _occ2_df[[str(i)  for i in range(10)]].values
-_N_DAYS     = len(_PRICES_ARR)
-
-
 def _t_out(t: int) -> float:
     return float(_T_OUT[max(0, min(t, len(_T_OUT) - 1))])
 
 
-def _sample_price_csv(t_slot: int, n: int) -> np.ndarray:
-    col = min(max(t_slot, 0), 9)
-    return np.random.choice(_PRICES_ARR[:, col], size=n, replace=True)
+def _sample_price_proc(price_t: float, price_prev: float, n: int) -> np.ndarray:
+    return np.array([price_model(price_t, price_prev) for _ in range(n)])
 
 
-def _sample_occ_csv(t_slot: int, n: int):
-    col = min(max(t_slot, 0), 9)
-    idx = np.random.randint(0, _N_DAYS, size=n)
-    return _OCC1_ARR[idx, col], _OCC2_ARR[idx, col]
+def _sample_occ_proc(occ1: float, occ2: float, n: int):
+    samples = [next_occupancy_levels(occ1, occ2) for _ in range(n)]
+    return (np.array([s[0] for s in samples]),
+            np.array([s[1] for s in samples]))
 
 
 def select_action(state: dict) -> dict:
@@ -122,10 +111,11 @@ def select_action(state: dict) -> dict:
     T1_obs = float(state['T1'])
     T2_obs = float(state['T2'])
     H_obs  = float(state['H'])
-    occ1   = float(state['Occ1'])
-    occ2   = float(state['Occ2'])
-    price  = float(state['price_t'])
-    To     = _t_out(t)
+    occ1        = float(state['Occ1'])
+    occ2        = float(state['Occ2'])
+    price       = float(state['price_t'])
+    price_prev  = float(state.get('price_previous', price))
+    To          = _t_out(t)
 
     y_hi1_0 = 1 if T1_obs > p['T_high'] else 0
     y_hi2_0 = 1 if T2_obs > p['T_high'] else 0
@@ -196,9 +186,8 @@ def select_action(state: dict) -> dict:
             )
 
             # Stochastic terms: MC draws for price and occupancy at t+1
-            t_next         = min(t + 1, 9)
-            p_smp          = _sample_price_csv(t_next, K_STOCH)
-            o1_smp, o2_smp = _sample_occ_csv(t_next, K_STOCH)
+            p_smp          = _sample_price_proc(price, price_prev, K_STOCH)
+            o1_smp, o2_smp = _sample_occ_proc(occ1, occ2, K_STOCH)
             stoch_const = float(np.mean(
                   w['price'] * p_smp / 10.0
                 + w['occ1']  * (o1_smp - 20.0) / 30.0

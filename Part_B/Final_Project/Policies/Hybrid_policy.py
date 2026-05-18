@@ -41,10 +41,11 @@ Public interface:
 import os
 import json
 import numpy as np
-import pandas as pd
 from scipy.cluster.vq import kmeans2
 import pyomo.environ as pyo
-from Data.v2_SystemCharacteristics import get_fixed_data
+from Data.v2_SystemCharacteristics  import get_fixed_data
+from Data.PriceProcessRestaurant    import price_model
+from Data.OccupancyProcessRestaurant import next_occupancy_levels
 
 # ── System parameters ─────────────────────────────────────────────────────────
 _SYS = get_fixed_data()
@@ -79,31 +80,20 @@ try:
 except FileNotFoundError:
     _VFA = {}
 
-# ── CSV scenario data ─────────────────────────────────────────────────────────
-_price_df   = pd.read_csv(os.path.join(_dir, 'Data/v2_PriceData.csv'),   header=0)
-_occ1_df    = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom1.csv'), header=0)
-_occ2_df    = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom2.csv'), header=0)
-_PRICES_ARR = _price_df[[str(i) for i in range(1, 11)]].values   # (n_days, 10)
-_OCC1_ARR   = _occ1_df[[str(i)  for i in range(10)]].values      # (n_days, 10)
-_OCC2_ARR   = _occ2_df[[str(i)  for i in range(10)]].values      # (n_days, 10)
-_N_DAYS     = len(_PRICES_ARR)
-
-
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _t_out(t: int) -> float:
     return float(_T_OUT[max(0, min(t, len(_T_OUT) - 1))])
 
 
-def _sample_price_csv(t_slot: int, n: int) -> np.ndarray:
-    col = min(max(t_slot, 0), 9)
-    return np.random.choice(_PRICES_ARR[:, col], size=n, replace=True)
+def _sample_price_proc(price_t: float, price_prev: float, n: int) -> np.ndarray:
+    return np.array([price_model(price_t, price_prev) for _ in range(n)])
 
 
-def _sample_occ_csv(t_slot: int, n: int):
-    col = min(max(t_slot, 0), 9)
-    idx = np.random.randint(0, _N_DAYS, size=n)
-    return _OCC1_ARR[idx, col], _OCC2_ARR[idx, col]
+def _sample_occ_proc(occ1: float, occ2: float, n: int):
+    samples = [next_occupancy_levels(occ1, occ2) for _ in range(n)]
+    return (np.array([s[0] for s in samples]),
+            np.array([s[1] for s in samples]))
 
 
 def _cluster(features: np.ndarray, k: int):
@@ -139,8 +129,8 @@ def _build_tree(state: dict, horizon: int, branches: int, n_init: int) -> list:
         t_slot       = t_now + stage + 1
         for pid in leaf_ids:
             par          = nodes[pid]
-            p_s          = _sample_price_csv(t_slot, n_smp)
-            o1_s, o2_s   = _sample_occ_csv(t_slot, n_smp)
+            p_s          = _sample_price_proc(par['price'], par['price_prev'], n_smp)
+            o1_s, o2_s   = _sample_occ_proc(par['occ1'], par['occ2'], n_smp)
             centers, prb = _cluster(np.column_stack([p_s, o1_s, o2_s]), branches)
             for b in range(branches):
                 cid = len(nodes)
@@ -163,19 +153,17 @@ def _build_tree(state: dict, horizon: int, branches: int, n_init: int) -> list:
 
 
 def _cfa_expr(nid: int, nd: dict, m, w: dict, c_root: int,
-               t_next: int, k_stoch: int = 40):
+               k_stoch: int = 40):
     """
     Return a Pyomo expression for the VFA terminal cost at leaf node `nid`.
 
     Parameters
     ----------
     nid    : leaf node id
-    nd     : leaf node dict (has 'price', 'occ1', 'occ2', 'T_out')
+    nd     : leaf node dict (has 'price', 'price_prev', 'occ1', 'occ2')
     m      : Pyomo ConcreteModel (has m.T1, m.T2, m.H, m.v indexed by node id)
-    w      : VFA weight dict for time t_next (keys: T1,T2,H,c,price,
-             price_previous,occ1,occ2,intercept)
+    w      : VFA weight dict (keys: T1,T2,H,c,price,price_previous,occ1,occ2,intercept)
     c_root : vent_counter from the current observed state (int)
-    t_next : time slot for VFA lookup (= t_now + HORIZON + 1), already clamped
     k_stoch: MC draws for the stochastic (price, occ) constant
     """
     # ── Deterministic VFA terms (linear Pyomo expressions) ────────────────────
@@ -203,8 +191,8 @@ def _cfa_expr(nid: int, nd: dict, m, w: dict, c_root: int,
     )
 
     # ── Stochastic constant: E[VFA contribution from future price and occ] ────
-    p_smp          = _sample_price_csv(t_next, k_stoch)
-    o1_smp, o2_smp = _sample_occ_csv(t_next, k_stoch)
+    p_smp          = _sample_price_proc(nd['price'], nd['price_prev'], k_stoch)
+    o1_smp, o2_smp = _sample_occ_proc(nd['occ1'], nd['occ2'], k_stoch)
     stoch_const = float(np.mean(
         w['price'] * p_smp / 10.0
         + w['occ1'] * (o1_smp - 20.0) / 30.0
@@ -375,12 +363,8 @@ def _solve_hybrid(state: dict, nodes: list, lambda_cfa: float) -> dict:
 
     cfa_cost = 0.0
     if lambda_cfa > 0.0 and w_leaf:
-        t_next_slot = min(t_now + max_stage + 1, 9)
         cfa_cost = lambda_cfa * sum(
-            nd['prob'] * _cfa_expr(
-                nd['id'], nd, m, w_leaf, c,
-                t_next=t_next_slot, k_stoch=40,
-            )
+            nd['prob'] * _cfa_expr(nd['id'], nd, m, w_leaf, c, k_stoch=40)
             for nd in nodes if not nd['children']   # leaf nodes only
         )
 
@@ -432,7 +416,7 @@ def select_action(state: dict) -> dict:
     -------
     dict with keys HeatPowerRoom1, HeatPowerRoom2, VentilationON.
     """
-    HORIZON    = 1      # two-stage: root + one recourse stage
+    HORIZON    = 2     # two-stage: root + one recourse stage
     BRANCHES   = 10     # k-means clusters per stage
     N_INIT     = 1000   # MC draws for first-stage clustering
     LAMBDA_CFA = 1.0    # full weighting of VFA terminal cost

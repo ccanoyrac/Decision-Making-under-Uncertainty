@@ -24,28 +24,48 @@ Public interface (same as all other Group 14 policies):
 import os
 import sys
 import numpy as np
-import pandas as pd
 
 _dir = os.path.dirname(os.path.abspath(__file__))
-if _dir not in sys.path:
-    sys.path.insert(0, _dir)
+for _d in [_dir, os.path.join(_dir, 'Data')]:
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 # Reuse the full hindsight MILP formulation and system parameters
 from Policies.hindsight_optimization import _solve_day, _P
+from Data.PriceProcessRestaurant import price_model
+from Data.OccupancyProcessRestaurant import next_occupancy_levels
 
-# ── Pre-load CSV and compute slot-wise historical means ───────────────────────
-_price_df = pd.read_csv(os.path.join(_dir, 'Data/v2_PriceData.csv'), header=0)
-_occ1_df  = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom1.csv'), header=0)
-_occ2_df  = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom2.csv'), header=0)
+# ── Compute slot-wise means from 100 simulated scenarios ─────────────────────
+_N_SCEN = 100
+_T      = 10
 
-_PRICES_MAT = _price_df[[str(i) for i in range(1, 11)]].values   # (n_days, 10)
-_OCC1_MAT   = _occ1_df[[str(i) for i in range(10)]].values       # (n_days, 10)
-_OCC2_MAT   = _occ2_df[[str(i) for i in range(10)]].values       # (n_days, 10)
+_rng = np.random.default_rng(seed=42)   # fixed seed → reproducible means
 
-# Mean disturbance at each of the 10 time slots across all historical days
-_MEAN_PRICES = _PRICES_MAT.mean(axis=0)   # (10,)
-_MEAN_OCC1   = _OCC1_MAT.mean(axis=0)     # (10,)
-_MEAN_OCC2   = _OCC2_MAT.mean(axis=0)     # (10,)
+_price_scens = np.zeros((_N_SCEN, _T))
+_occ1_scens  = np.zeros((_N_SCEN, _T))
+_occ2_scens  = np.zeros((_N_SCEN, _T))
+
+for _s in range(_N_SCEN):
+    # ── Price trajectory ──────────────────────────────────────────────────────
+    _p = [float(_rng.uniform(2, 8))]
+    for _t in range(1, _T):
+        _prev_prev = _p[-2] if _t > 1 else 6.0
+        _p.append(price_model(_p[-1], _prev_prev))
+    _price_scens[_s] = _p
+
+    # ── Occupancy trajectories ────────────────────────────────────────────────
+    _r1 = float(_rng.uniform(25, 35))
+    _r2 = float(_rng.uniform(15, 25))
+    _occ1_scens[_s, 0] = _r1
+    _occ2_scens[_s, 0] = _r2
+    for _t in range(1, _T):
+        _r1, _r2 = next_occupancy_levels(_r1, _r2)
+        _occ1_scens[_s, _t] = _r1
+        _occ2_scens[_s, _t] = _r2
+
+_MEAN_PRICES = _price_scens.mean(axis=0)   # (10,)
+_MEAN_OCC1   = _occ1_scens.mean(axis=0)    # (10,)
+_MEAN_OCC2   = _occ2_scens.mean(axis=0)    # (10,)
 
 
 def _dummy_action(state):

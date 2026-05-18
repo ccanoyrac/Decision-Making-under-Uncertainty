@@ -6,12 +6,12 @@ Public interface:
     select_action(state) -> {'HeatPowerRoom1', 'HeatPowerRoom2', 'VentilationON'}
 """
 
-import os
 import numpy as np
-import pandas as pd
 from scipy.cluster.vq import kmeans2
 import pyomo.environ as pyo
-from Data.v2_SystemCharacteristics import get_fixed_data
+from Policies.Data.v2_SystemCharacteristics import get_fixed_data
+from Data.PriceProcessRestaurant import price_model
+from Data.OccupancyProcessRestaurant import next_occupancy_levels
 
 # ── System parameters ─────────────────────────────────────────────────────────
 _SYS = get_fixed_data()
@@ -34,20 +34,6 @@ _P = {
 _T_OUT     = _SYS['outdoor_temperature']   # deterministic outdoor temp schedule (known in advance)
 _VENT_UP   = 3                             # minimum ventilation on-time (hours)
 
-# ── CSV-based scenario data ───────────────────────────────────────────────────
-# Prices and occupancies are drawn empirically from the historical CSV files,
-# matching the data source used by the hindsight optimisation.
-_dir = os.path.dirname(os.path.abspath(__file__))
-_price_df = pd.read_csv(os.path.join(_dir, 'Data/v2_PriceData.csv'),    header=0)
-_occ1_df  = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom1.csv'),  header=0)
-_occ2_df  = pd.read_csv(os.path.join(_dir, 'Data/OccupancyRoom2.csv'),  header=0)
-
-# price columns '1'–'10' → 0-indexed slots 0–9
-# occupancy columns '0'–'9' → 0-indexed slots 0–9
-_PRICES_ARR = _price_df[[str(i) for i in range(1, 11)]].values   # (n_days, 10)
-_OCC1_ARR   = _occ1_df[[str(i)  for i in range(10)]].values      # (n_days, 10)
-_OCC2_ARR   = _occ2_df[[str(i)  for i in range(10)]].values      # (n_days, 10)
-_N_DAYS     = len(_PRICES_ARR)
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -56,17 +42,17 @@ def _t_out(t):
     return float(_T_OUT[max(0, min(t, len(_T_OUT) - 1))])
 
 
-def _sample_price_csv(t_slot, n):
-    """Sample n prices from the CSV at time slot t_slot (0-indexed, clamped to 0–9)."""
-    col = min(max(t_slot, 0), 9)
-    return np.random.choice(_PRICES_ARR[:, col], size=n, replace=True)
+def _sample_price_model(current_price, previous_price, n):
+    """Sample n next-step prices conditioned on current and previous price."""
+    return np.array([price_model(current_price, previous_price) for _ in range(n)])
 
 
-def _sample_occ_csv(t_slot, n):
-    """Sample n correlated (occ1, occ2) pairs from the CSV at time slot t_slot (0-indexed)."""
-    col = min(max(t_slot, 0), 9)
-    idx = np.random.randint(0, _N_DAYS, size=n)
-    return _OCC1_ARR[idx, col], _OCC2_ARR[idx, col]
+def _sample_occ_model(occ1, occ2, n):
+    """Sample n correlated (occ1, occ2) pairs conditioned on current occupancies."""
+    draws = [next_occupancy_levels(occ1, occ2) for _ in range(n)]
+    o1 = np.array([d[0] for d in draws])
+    o2 = np.array([d[1] for d in draws])
+    return o1, o2
 
 
 def _cluster(features, k):
@@ -84,8 +70,9 @@ def _build_tree(state, horizon, branches, n_init):
     """Monte Carlo + k-means scenario tree. Returns list of node dicts.
 
     T_out is deterministic and taken directly from the fixed schedule for every
-    node.  Prices and occupancies are uncertain: future values are sampled
-    empirically from the historical CSV data at the correct time slot.
+    node.  Prices and occupancies are uncertain: future values are sampled from
+    the parametric generative models conditioned on the parent node's state,
+    matching the environment's true data-generating process.
     """
     t_now = int(state.get('current_time', 0))
     nodes = [{
@@ -93,7 +80,7 @@ def _build_tree(state, horizon, branches, n_init):
         'price': float(state['price_t']),
         'price_prev': float(state.get('price_previous', state['price_t'])),
         'occ1': float(state['Occ1']), 'occ2': float(state['Occ2']),
-        'T_out': _t_out(t_now),   # always from the deterministic schedule
+        'T_out': _t_out(t_now),
         'prob': 1.0,
     }]
     m_cond   = max(n_init // branches, 30)
@@ -102,12 +89,12 @@ def _build_tree(state, horizon, branches, n_init):
     for stage in range(horizon):
         n_smp        = n_init if stage == 0 else m_cond
         new_leaf_ids = []
-        # time slot of the children being created at this stage
         t_slot = t_now + stage + 1
         for pid in leaf_ids:
             par = nodes[pid]
-            p_s          = _sample_price_csv(t_slot, n_smp)
-            o1_s, o2_s   = _sample_occ_csv(t_slot, n_smp)
+            # Sample conditioned on parent node's price and occupancy
+            p_s        = _sample_price_model(par['price'], par['price_prev'], n_smp)
+            o1_s, o2_s = _sample_occ_model(par['occ1'], par['occ2'], n_smp)
             centers, prb = _cluster(np.column_stack([p_s, o1_s, o2_s]), branches)
             for b in range(branches):
                 cid = len(nodes)
@@ -115,7 +102,7 @@ def _build_tree(state, horizon, branches, n_init):
                     'id': cid, 'stage': stage + 1, 'parent_id': pid, 'children': [],
                     'price': float(centers[b, 0]), 'price_prev': par['price'],
                     'occ1':  float(centers[b, 1]), 'occ2': float(centers[b, 2]),
-                    'T_out': _t_out(t_slot),   # deterministic, same for all branches
+                    'T_out': _t_out(t_slot),
                     'prob':  par['prob'] * float(prb[b]),
                 })
                 par['children'].append(cid)
@@ -343,8 +330,8 @@ def select_action(state: dict) -> dict:
     Multi-stage stochastic programming policy.
 
     Parameters (hardcoded inside):
-        horizon  = 1   look-ahead stages
-        branches = 100  k-means clusters per stage (scenario branches)
+        horizon  = 2   look-ahead stages
+        branches = 10  k-means clusters per stage (scenario branches)
         n_init   = 10000 Monte Carlo draws before clustering
 
     Parameters
