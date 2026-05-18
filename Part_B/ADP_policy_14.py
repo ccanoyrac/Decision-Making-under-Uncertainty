@@ -28,44 +28,60 @@ params = {
 # ==============================================================================
 # 2. FEATURE MAPPING  (must match the normalisation used during ADP training)
 #
-# phi(x_t) in R^8 — normalised to a stable range:
+# phi(x_t) in R^12 — normalised to a stable range:
 #
-#   idx  feature          formula                     baseline  scale
-#    0   T1               (T1   - 22) / 8             22 °C     8 °C
-#    1   T2               (T2   - 22) / 8             22 °C     8 °C
-#    2   H                (H    - 40) / 40             40 %      40 %
-#    3   price             price / 10                  0         10 €/kWh
-#    4   price_previous    price_prev / 10             0         10 €/kWh
-#    5   occ1             (occ1 - 30) / 30             30 pax    30
-#    6   occ2             (occ2 - 20) / 20             20 pax    20
-#    7   c                 c / 3                       0         3
+#   idx  feature          formula                              baseline  scale
+#    0   T1               (T1   - 22) / 8                     22 °C     8 °C
+#    1   T2               (T2   - 22) / 8                     22 °C     8 °C
+#    2   H                (H    - 40) / 40                     40 %      40 %
+#    3   price             price / 10                          0         10 €/kWh
+#    4   price_previous    price_prev / 10                     0         10 €/kWh
+#    5   occ1             (occ1 - 30) / 30                     30 pax    30
+#    6   occ2             (occ2 - 20) / 20                     20 pax    20
+#    7   c                 c / 3                               0         3
+#    8   pen1              max(0, 22.0 - T1) / 3               —         3 °C
+#    9   pen2              max(0, 22.0 - T2) / 3               —         3 °C
+#   10   price × pen1      (price/10) * max(0,22.0-T1)/3       —         —
+#   11   price × pen2      (price/10) * max(0,22.0-T2)/3       —         —
+#
+# Features 10/11 capture the interaction "cold rooms during high-price periods
+# are disproportionately costly" — expressible with the cross-product feature
+# in a linear VFA; their MILP encoding uses (E_price/10)*(pen_x/3) which is
+# linear in the epigraph variable pen_x under the CE substitution.
 #
 # The Ridge intercept is fitted separately (fit_intercept=True) and stored as
-# the 9th component of eta[t]:  VFA = phi(x)^T eta[:8] + eta[8].
+# the 13th component of eta[t]:  VFA = phi(x)^T eta[:12] + eta[12].
 # ==============================================================================
-N_FEAT = 8
+N_FEAT = 12
 
 
 def _phi(state: dict) -> np.ndarray:
-    """8-feature state vector. eta[8] holds the Ridge intercept."""
-    T1 = float(state['T1'])
-    T2 = float(state['T2'])
+    """12-feature state vector. eta[12] holds the Ridge intercept."""
+    T1     = float(state['T1'])
+    T2     = float(state['T2'])
+    pen1   = max(0.0, 22.0 - T1) / 3.0
+    pen2   = max(0.0, 22.0 - T2) / 3.0
+    p_norm = float(state['price']) / 10.0
     return np.array([
         (T1                                                           - 22.0) /  8.0,
         (T2                                                           - 22.0) /  8.0,
         (float(state.get('H', 0.0))                                   - 40.0) / 40.0,
-         float(state['price'])                                                 / 10.0,
+         p_norm,
          float(state.get('price_previous', state['price']))                   / 10.0,
         (float(state.get('occ1', 0.0))                                - 30.0) / 30.0,
         (float(state.get('occ2', 0.0))                                - 20.0) / 20.0,
          float(state.get('c', 0))                                              /  3.0,
+         pen1,
+         pen2,
+         p_norm * pen1,
+         p_norm * pen2,
     ])
 
 
 # ==============================================================================
 # 3. LINEAR VFA WEIGHTS  (produced by ADP_policy_14.ipynb)
 #
-# Each eta[t] is a 9-vector: [w_0 .. w_7, intercept].
+# Each eta[t] is a 13-vector: [w_0 .. w_11, intercept].
 # ==============================================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _WEIGHTS_PATH = os.path.join(_HERE, 'output', 'adp_weights.json')
@@ -88,7 +104,7 @@ try:
         print(f"[ADP]   t={_t}: {np.round(ETA[_t], 4)}")
 except FileNotFoundError:
     print(f"[ADP] WARNING: {_WEIGHTS_PATH} not found — using zero weights")
-    ETA = {t: [0.0] * (N_FEAT + 1) for t in range(10)}  # 9 zeros per timestep
+    ETA = {t: [0.0] * (N_FEAT + 1) for t in range(10)}  # 13 zeros per timestep
 
 # ==============================================================================
 # 4. CERTAINTY-EQUIVALENCE — EXPECTED NEXT-PERIOD EXOGENOUS VALUES
@@ -126,13 +142,14 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     Objective (minimised over p1, p2 in [0, P_max] and v in {0, 1}):
 
         price * (p1 + p2 + P_vent * v)
-        + phi(E[x_{t+1}])^T * eta[:8] + eta[8]
+        + phi(E[x_{t+1}])^T * eta[:12] + eta[12]
         + Big-M overrule penalties
 
-    Features [0,1,2,7] of phi(E[x_{t+1}]) are Pyomo affine expressions in
+    Features [0,1,2,7,8,9] of phi(E[x_{t+1}]) are Pyomo affine expressions in
     the decision variables; features [3,4,5,6] are scalar constants under the
     certainty-equivalence substitution, evaluated in pure Python before the
-    MILP is assembled.
+    MILP is assembled.  Hockey-stick features [8,9] use auxiliary NonNegativeReal
+    variables with linear lower-bound constraints to preserve MILP structure.
 
     Dynamics use the realised current occupancy (known from the state dict).
     Expected next-period values (K=50 MC samples) are used only for the
@@ -183,19 +200,35 @@ def solve_adp_step(state: dict, eta: list, params: dict) -> dict:
     elif c == 1: c_next_norm = 0.0
     else:        c_next_norm = 1.0 / 3.0
 
-    # VFA of expected next state: phi(E[x_{t+1}])^T * eta[:8] + eta[8]
-    # phi features [0,1,2,7]: Pyomo expressions (linear in p1, p2, v).
+    # Asymmetric penalty auxiliaries: epigraph encoding of max(0, 22.0 - T_r_next) / 3.
+    # Threshold at T_ok=22°C gives the VFA an early-warning gradient as temperatures
+    # drop below the comfort target, well before the hard constraint T_low=18°C.
+    # Upper bound 30: pen_x=30 ↔ T_r_next=22-30=-8°C — physically impossible.
+    # Physical worst case at T1x≈2°C: pen_x≈(22-2)/3≈6.7, well below the cap.
+    m.pen1_x = pyo.Var(bounds=(0.0, 30.0))
+    m.pen2_x = pyo.Var(bounds=(0.0, 30.0))
+    m.c_pen1 = pyo.Constraint(expr=m.pen1_x >= 22.0 - m.T1x)
+    m.c_pen2 = pyo.Constraint(expr=m.pen2_x >= 22.0 - m.T2x)
+
+    # VFA of expected next state: phi(E[x_{t+1}])^T * eta[:12] + eta[12]
+    # phi features [0,1,2,7,8,9,10,11]: Pyomo expressions (linear in p1, p2, v).
     # phi features [3,4,5,6]: constants evaluated from CE substitution.
+    # Cross-product terms [10,11]: (E_price/10)*pen_x/3 — linear in pen_x (CE makes price constant).
+    e_p_norm = exp_price_next / 10.0
     vfa_next = (
-        eta[8]                                                      +  # Ridge intercept
-        eta[0] * ((m.T1x         - 22.0) /  8.0)                   +
-        eta[1] * ((m.T2x         - 22.0) /  8.0)                   +
-        eta[2] * ((m.Hx          - 40.0) / 40.0)                   +
-        eta[3] * ( exp_price_next          / 10.0)                  +
-        eta[4] * ( price                   / 10.0)                  +
-        eta[5] * ((exp_occ1_next - 30.0) / 30.0)                   +
-        eta[6] * ((exp_occ2_next - 20.0) / 20.0)                   +
-        eta[7] *  c_next_norm
+        eta[12]                                                     +  # Ridge intercept
+        eta[0]  * ((m.T1x         - 22.0) /  8.0)                  +
+        eta[1]  * ((m.T2x         - 22.0) /  8.0)                  +
+        eta[2]  * ((m.Hx          - 40.0) / 40.0)                  +
+        eta[3]  * ( exp_price_next          / 10.0)                 +
+        eta[4]  * ( price                   / 10.0)                 +
+        eta[5]  * ((exp_occ1_next - 30.0) / 30.0)                  +
+        eta[6]  * ((exp_occ2_next - 20.0) / 20.0)                  +
+        eta[7]  *  c_next_norm                                      +
+        eta[8]  * (m.pen1_x / 3.0)                                 +
+        eta[9]  * (m.pen2_x / 3.0)                                 +
+        eta[10] * e_p_norm * (m.pen1_x / 3.0)                      +
+        eta[11] * e_p_norm * (m.pen2_x / 3.0)
     )
 
     # Soft Big-M penalties for mandatory overrule actions
@@ -245,7 +278,7 @@ def select_action(state: dict) -> dict:
     v     = decisions['VentilationON']
     price = float(state['price'])
     imm   = price * (p1 + p2 + params['P_vent'] * v)
-    vfa   = float(np.dot(_phi(state), eta[:N_FEAT]) + eta[N_FEAT])  # eta[8] = intercept
+    vfa   = float(np.dot(_phi(state), eta[:N_FEAT]) + eta[N_FEAT])  # eta[12] = intercept
     print(f"  t={t} | p1={p1:.2f} p2={p2:.2f} v={v}"
           f" | imm={imm:.3f} vfa_curr={vfa:.2f} | price={price:.2f}"
           f" | T1={state['T1']:.1f} T2={state['T2']:.1f}")
