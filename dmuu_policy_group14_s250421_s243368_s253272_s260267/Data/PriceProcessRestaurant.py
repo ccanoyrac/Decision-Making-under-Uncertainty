@@ -12,7 +12,7 @@ NOT TO BE CHANGED BY THE STUDENTS
 
 import numpy as np
 import matplotlib.pyplot as plt
-import v2_SystemCharacteristics
+from Data import v2_SystemCharacteristics as v2_SystemCharacteristics
 
 
 def price_model(current_price, previous_price):
@@ -58,7 +58,7 @@ for i in range(num_paths):
 
     all_paths.append(traj)
 
-
+"""
 # -----------------------------
 # Plot
 # -----------------------------
@@ -79,3 +79,4 @@ import pandas as pd
 
 #pd.DataFrame(all_paths).to_csv("OutOfSamplePriceData.csv", index=False)
 
+"""
